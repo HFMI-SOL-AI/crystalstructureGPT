@@ -1,16 +1,34 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "nanogpt"
+name = "structureGPT"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "torch==2.2.0",
-    "numpy",
+    "torch",
+    "numpy<2",
     "datasets",
     "tiktoken",
     "tqdm",
     "transformers",
     "wandb",
-    "pandas>=2.0.3",
+    "pandas",
+    "structure_tokenizer",
+    "pymatgen>=2025.10.7",
+]
+
+[tool.uv.sources]
+structure_tokenizer = { path = "../structure-tokenizer" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[dependency-groups]
+dev = [
+    "black>=25.9.0",
+    "pytest>=8.4.2",
 ]

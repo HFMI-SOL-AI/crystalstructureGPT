@@ -14,21 +14,24 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123
 - Run on the worker node:
 $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
+
+Example Usage:
+    python src/nanogpt/train.py --eval_interval=10 --dataset=cst/test_out --batch_size=128 --block_size=128 --compile=False
 """
 
 import os
 import time
 import math
-import pickle
 from contextlib import nullcontext
+from pathlib import Path
 
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
-from vocab import vocab
+from nanogpt.model import GPTConfig, GPT
+from nanogpt.vocab import load_meta, get_stoi_itos
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -45,19 +48,19 @@ wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'slice'
+dataset = 'cst'
 gradient_accumulation_steps = 4 # used to simulate larger batch sizes
 batch_size = 16 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
-n_layer = 36
-n_head = 20
-n_embd = 1280
+n_layer = 12
+n_head = 12
+n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 3e-4 # max learning rate
-max_iters =  500 #600000 # total number of training iterations
+max_iters =  2000 #600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -75,7 +78,9 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open('configurator.py').read()) # overrides from command line or config file
+configurator_path = Path(__file__).resolve().parent / 'configurator.py'
+with open(configurator_path, 'r', encoding='utf-8') as _cfg_fh:
+    exec(_cfg_fh.read(), globals()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
@@ -115,51 +120,65 @@ for i in range(torch.cuda.device_count()):
     print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+ctx = nullcontext() if device_type == 'cpu' else torch.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
+train_cache_path = os.path.join(data_dir, 'train.npy')
+val_cache_path = os.path.join(data_dir, 'val.npy')
+
+if not os.path.exists(train_cache_path) or not os.path.exists(val_cache_path):
+    raise FileNotFoundError(
+        f"Prepared dataset not found in {data_dir}. Run data/cst/prepare.py to generate train/val splits."
+    )
+
+train_cache = np.load(train_cache_path, allow_pickle=True).item()
+val_cache = np.load(val_cache_path, allow_pickle=True).item()
+
+meta = load_meta(data_dir)
+stoi, itos = get_stoi_itos(meta)
+pad_token_id = meta.get("pad_token_id", 0)
+embedding_dim = meta.get("embedding_dim", train_cache["embeddings"].shape[1])
+vocab_size = meta.get("vocab_size", len(itos))
+
+
+def _select_cache(split: str):
+    return train_cache if split == 'train' else val_cache
+
+
 def get_batch(split):
-    data = np.load(os.path.join(data_dir, f'{split}.npy'), allow_pickle=True).item()
+    data = _select_cache(split)
 
-    # Get random indices
-    ix = torch.randint(len(data['embeddings']), (batch_size,))
-    ix = ix.numpy()  # Convert to numpy for indexing
+    num_samples = len(data['token_ids'])
+    if num_samples == 0:
+        raise ValueError(f"No samples available in the {split} split.")
 
-    # Get embeddings and slice ids
+    ix = np.random.randint(0, num_samples, size=batch_size)
+
     embeddings = torch.tensor(data['embeddings'][ix]).float().to(device)
 
-    # Get slice tokens with proper padding
-    slices = [data['slice_ids'][i] for i in ix]  # Get slices for selected indices
-    max_len = min(max(len(s) for s in slices), block_size)
-    x = torch.zeros((batch_size, max_len), dtype=torch.long)
-    y = torch.zeros((batch_size, max_len), dtype=torch.long)
+    sequences = [data['token_ids'][i] for i in ix]
+    valid_lengths = [len(seq) for seq in sequences if len(seq) > 1]
+    if not valid_lengths:
+        raise ValueError("All sequences are too short; ensure tokenised data contains at least two tokens.")
 
-    for i, slice_ids in enumerate(slices):
-        slice_ids = slice_ids[:max_len]
-        seq_len = len(slice_ids)
-        if seq_len > 1:  # We need at least two tokens
-            x[i, :seq_len-1] = torch.tensor(slice_ids[:-1])
-            y[i, :seq_len-1] = torch.tensor(slice_ids[1:])
+    max_len = min(max(valid_lengths), block_size)
+    x = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long, device=device)
+    y = torch.full((batch_size, max_len), -1, dtype=torch.long, device=device)
 
-    # Make sure to move tensors to the correct device
-    x = x.to(device)
-    y = y.to(device)
+    for i, seq in enumerate(sequences):
+        seq = seq[:max_len]
+        seq_len = len(seq)
+        if seq_len > 1:
+            seq_tensor = torch.tensor(seq, dtype=torch.long, device=device)
+            x[i, :seq_len-1] = seq_tensor[:-1]
+            y[i, :seq_len-1] = seq_tensor[1:]
 
     return embeddings, x, y
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
-
-# attempt to derive vocab_size from the dataset
-meta_path = os.path.join(data_dir, 'meta.pkl')
-meta_vocab_size = None
-if os.path.exists(meta_path):
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    meta_vocab_size = meta['vocab_size']
-    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
 model_args = dict(
@@ -168,17 +187,17 @@ model_args = dict(
     n_embd=n_embd,
     block_size=block_size,
     bias=bias,
-    vocab_size=len(vocab),
+    vocab_size=vocab_size,
     dropout=dropout,
-    embedding_dim=256
+    embedding_dim=embedding_dim
 ) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
     # determine the vocab size we'll use for from-scratch training
-    if meta_vocab_size is None:
+    if vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+        model_args['vocab_size'] = 50304
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':
