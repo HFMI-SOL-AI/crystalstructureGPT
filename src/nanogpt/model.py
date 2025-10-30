@@ -10,10 +10,14 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+from typing import Optional, Sequence, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+if TYPE_CHECKING:
+    from .constraints import CrystalConstraintState
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -318,6 +322,7 @@ class GPT(nn.Module):
         top_k=None,
         embeddings=None,
         eos_token=None,
+        constraints: Optional[Sequence["CrystalConstraintState"]] = None,
     ):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
@@ -325,6 +330,17 @@ class GPT(nn.Module):
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
         finished = torch.zeros(idx.size(0), dtype=torch.bool, device=idx.device)
+        constraint_states: Optional[Sequence["CrystalConstraintState"]] = None
+        if constraints is not None:
+            if len(constraints) != idx.size(0):
+                raise ValueError(
+                    "Number of constraint states must match batch size during generation."
+                )
+            constraint_states = list(constraints)
+            for b, constraint in enumerate(constraint_states):
+                if constraint is None:
+                    continue
+                constraint.observe_sequence(idx[b].tolist())
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
@@ -332,6 +348,21 @@ class GPT(nn.Module):
             logits, _ = self(idx_cond, embeddings=embeddings)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
+
+            if constraint_states is not None:
+                for b, constraint in enumerate(constraint_states):
+                    if constraint is None or constraint.is_disabled or constraint.is_finished:
+                        continue
+                    allowed_ids = [tok for tok in constraint.allowed_token_ids() if tok is not None]
+                    if not allowed_ids:
+                        continue
+                    row = logits[b]
+                    allow_tensor = torch.tensor(allowed_ids, dtype=torch.long, device=logits.device)
+                    mask = torch.ones_like(row, dtype=torch.bool)
+                    mask[allow_tensor] = False
+                    if mask.all().item():
+                        continue
+                    logits[b] = row.masked_fill(mask, float("-inf"))
 
             if eos_token is not None:
                 logits = logits.clone()
@@ -346,6 +377,12 @@ class GPT(nn.Module):
             probs = F.softmax(logits, dim=-1)
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
+
+            if constraint_states is not None:
+                for b, constraint in enumerate(constraint_states):
+                    if constraint is None or constraint.is_disabled:
+                        continue
+                    constraint.observe_token(idx_next[b].item())
 
             if eos_token is not None:
                 finished = finished | (idx_next.squeeze(-1) == eos_token)
