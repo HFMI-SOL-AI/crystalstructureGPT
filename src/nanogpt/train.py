@@ -53,23 +53,23 @@ gradient_accumulation_steps = 4 # used to simulate larger batch sizes
 batch_size = 16 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
-n_layer = 12
-n_head = 12
-n_embd = 768
-dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
+n_layer = 16
+n_head = 16
+n_embd = 1024
+dropout = 0.1 # encourage regularisation on crystal data
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
-learning_rate = 3e-4 # max learning rate
-max_iters =  2000 #600000 # total number of training iterations
+learning_rate = 1.5e-4 # max learning rate tuned for crystal data
+max_iters =  2_000 #600_000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 150 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
-min_lr = 3e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+warmup_iters = 200 # how many steps to warm up for
+lr_decay_iters = max_iters # align decay schedule with training horizon
+min_lr = 5e-6 # minimum learning rate
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
