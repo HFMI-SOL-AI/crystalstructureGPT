@@ -194,6 +194,9 @@ class CrystalConstraintBuilder:
     def category_ids(self, category: str) -> set[int]:
         return getattr(self._categories, category, set())
 
+    def token_text(self, token_id: int) -> str | None:
+        return self._itos.get(token_id)
+
     def lattice_sequence(self) -> Sequence[str]:
         return self._lattice_sequence
 
@@ -215,6 +218,7 @@ class CrystalConstraintState:
         self._lattice_index = 0
         self._site_phase = "wyckoff"
         self._require_site_count = bool(builder.category_ids("site_count"))
+        self._sites_remaining: int | None = None
         self._advance_lattice_if_empty()
         self._refresh_site_phase()
 
@@ -243,6 +247,9 @@ class CrystalConstraintState:
         if category in {"pad", "bos"}:
             return
         if category == "eos":
+            if self._sites_remaining not in (None, 0):
+                self._disable()
+                return
             self._finished = True
             return
 
@@ -256,6 +263,12 @@ class CrystalConstraintState:
 
         if self._phase == "site_count":
             if category == "site_count":
+                token = self._builder.token_text(token_id)
+                count = self._parse_site_count(token)
+                if count is None or count < 0:
+                    self._disable()
+                    return
+                self._sites_remaining = count
                 self._set_sites_phase()
                 return
             self._disable()
@@ -310,7 +323,7 @@ class CrystalConstraintState:
 
         if self._phase == "lattice":
             if self._lattice_index >= len(self._lattice_sequence):
-                self._transition_to_sites()
+                self._enter_post_lattice_phase()
                 return self.allowed_token_ids()
             category = self._lattice_sequence[self._lattice_index]
             return sorted(self._builder.category_ids(category))
@@ -323,9 +336,12 @@ class CrystalConstraintState:
     def _allowed_site_tokens(self) -> list[int]:
         if self._site_phase == "wyckoff":
             allowed = set(self._builder.category_ids("wyckoff"))
-            eos_id = self._builder.eos_id
-            if eos_id is not None:
-                allowed.add(eos_id)
+            if self._sites_remaining == 0:
+                allowed.clear()
+            if self._sites_remaining in (0, None):
+                eos_id = self._builder.eos_id
+                if eos_id is not None:
+                    allowed.add(eos_id)
             return sorted(allowed)
         if self._site_phase == "elements":
             return sorted(self._builder.category_ids("elements"))
@@ -363,6 +379,8 @@ class CrystalConstraintState:
         elif self._site_phase == "frac_z":
             if category == "frac_z":
                 self._advance_site_phase("wyckoff")
+                if self._sites_remaining is not None and self._sites_remaining > 0:
+                    self._sites_remaining -= 1
             else:
                 self._disable()
         else:
@@ -413,3 +431,12 @@ class CrystalConstraintState:
 
     def _disable(self) -> None:
         self._disabled = True
+
+    @staticmethod
+    def _parse_site_count(token: str | None) -> int | None:
+        if token is None or not token.startswith("[Z:") or not token.endswith("]"):
+            return None
+        try:
+            return int(token[3:-1])
+        except ValueError:
+            return None
