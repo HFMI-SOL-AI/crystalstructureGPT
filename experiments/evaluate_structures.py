@@ -5,8 +5,8 @@ Loads a trained checkpoint, generates token sequences conditioned on
 validation embeddings, decodes them back to Pymatgen structures, and
 compares against the ground-truth structures.
 Usage example:
-python -m src.nanogpt.evaluate_structures \
-    --data-dir data/cst/test_out \
+python evaluate_structures.py \
+    --data-dir data/cst/out \
     --checkpoint out/ckpt.pt \
     --split val \
     --limit 100 \
@@ -20,10 +20,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+import tqdm
 import numpy as np
 import torch
 from pymatgen.core import Structure
 
+from nanogpt.constraints import CrystalConstraintBuilder
 from nanogpt.model import GPT, GPTConfig
 from nanogpt.vocab import get_stoi_itos, load_meta
 
@@ -44,6 +46,7 @@ class EvalResult:
     wyckoff_match: bool
     lattice_rmse: float
     frac_rmse: float | None
+    composition_match: bool
 
 
 def parse_args() -> argparse.Namespace:
@@ -92,6 +95,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional top-k sampling restriction.",
     )
+    parser.add_argument(
+        "--no-constraints",
+        action="store_true",
+        help="Disable constrained decoding and fall back to unconstrained sampling.",
+    )
+    parser.add_argument(
+        "--force-sg",
+        action="store_true",
+        help="Seed generation with the ground-truth spacegroup token to assess upper-bound performance.",
+    )
     return parser.parse_args()
 
 
@@ -115,6 +128,7 @@ def evaluate(args: argparse.Namespace) -> list[EvalResult]:
 
     meta = load_meta(data_dir)
     stoi, itos = get_stoi_itos(meta)
+    constraint_builder = None if args.no_constraints else CrystalConstraintBuilder.from_meta(meta)
     bos_token = meta.get("bos_token") or "[BOS]"
     eos_token_id = stoi.get(meta.get("eos_token") or "[EOS]")
     eos_token = meta.get("eos_token") or "[EOS]"
@@ -131,9 +145,31 @@ def evaluate(args: argparse.Namespace) -> list[EvalResult]:
 
     results: list[EvalResult] = []
 
-    for idx in range(num_samples):
+    # for idx in range(num_samples):
+    for idx in tqdm.tqdm(range(num_samples), desc="Evaluating samples"):
         cond = torch.tensor(embeddings[idx]).float().unsqueeze(0).to(args.device)
-        start = torch.tensor([[stoi[bos_token]]], dtype=torch.long, device=args.device)
+
+        if args.force_sg:
+            prefix_ids: list[int] = []
+            seen_sg = False
+            for token_id in token_ids[idx]:
+                token_int = int(token_id)
+                token = itos.get(token_int)
+                if token is None:
+                    continue
+                prefix_ids.append(token_int)
+                if token.startswith("[SG:"):
+                    seen_sg = True
+                    break
+            if not prefix_ids or not itos.get(prefix_ids[0], "").startswith("[BOS]"):
+                prefix_ids.insert(0, stoi[bos_token])
+            if not seen_sg:
+                # fallback to BOS only if SG token missing
+                prefix_ids = [stoi[bos_token]]
+        else:
+            prefix_ids = [stoi[bos_token]]
+
+        start = torch.tensor([prefix_ids], dtype=torch.long, device=args.device)
         with torch.no_grad():
             generated = model.generate(
                 idx=start,
@@ -142,6 +178,7 @@ def evaluate(args: argparse.Namespace) -> list[EvalResult]:
                 temperature=args.temperature,
                 top_k=args.top_k,
                 eos_token=eos_token_id,
+                constraints=[constraint_builder.new_state(start[0].tolist())] if constraint_builder else None,
             )[0].tolist()
 
         gt_ids = token_ids[idx]
@@ -167,8 +204,13 @@ def evaluate(args: argparse.Namespace) -> list[EvalResult]:
         gen_struct = _structure_from_tokens(generated_tokens)
         gt_struct = _structure_from_tokens(reference_tokens)
 
+        composition_match = False
+
         if gen_struct is not None and gt_struct is not None:
-            sg_match = gen_struct.get_space_group_info()[0] == gt_struct.get_space_group_info()[0]
+            try:
+                sg_match = gen_struct.get_space_group_info()[0] == gt_struct.get_space_group_info()[0]
+            except Exception:
+                sg_match = False
             wyckoff_match = [
                 tok for tok in generated_tokens if tok.startswith("[WY:")
             ] == [
@@ -185,6 +227,14 @@ def evaluate(args: argparse.Namespace) -> list[EvalResult]:
                     frac_rmse = None
             except Exception:
                 frac_rmse = None
+
+            try:
+                composition_match = (
+                    gen_struct.composition.reduced_formula
+                    == gt_struct.composition.reduced_formula
+                )
+            except Exception:
+                composition_match = False
         else:
             sg_match = False
             wyckoff_match = False
@@ -199,6 +249,7 @@ def evaluate(args: argparse.Namespace) -> list[EvalResult]:
                 wyckoff_match=wyckoff_match,
                 lattice_rmse=lattice_rmse,
                 frac_rmse=frac_rmse,
+                composition_match=composition_match,
             )
         )
 
@@ -213,6 +264,7 @@ def main() -> None:
     exact = sum(r.exact_match for r in results)
     sg = sum(r.spacegroup_match for r in results)
     wy = sum(r.wyckoff_match for r in results)
+    comp = sum(r.composition_match for r in results)
     lattice_errors = np.array([r.lattice_rmse for r in results], dtype=float)
     frac_errors = [r.frac_rmse for r in results if r.frac_rmse is not None]
 
@@ -232,6 +284,7 @@ def main() -> None:
     print(f"Lattice RMSE (mean):    {np.nanmean(lattice_errors):.4f}")
     if frac_errors:
         print(f"Fractional RMSE (mean): {np.mean(frac_errors):.4f}")
+    print(f"Composition match:      {comp / total:.2%}")
 
     if valid_total:
         print("--- Valid decodes only ---")
@@ -242,6 +295,8 @@ def main() -> None:
         print(f"Lattice RMSE (mean):    {valid_lattice.mean():.4f}")
         if valid_frac:
             print(f"Fractional RMSE (mean): {np.mean(valid_frac):.4f}")
+        valid_comp = sum(r.composition_match for r in valid_results)
+        print(f"Composition match:      {valid_comp / valid_total:.2%}")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 Sample crystal-structure tokenizer outputs from a trained nanoGPT model.
 Usage example:
 python sample.py \
-    --data-dir data/cst/test_out \
+    --data-dir data/cst/out \
     --out-dir out \
     --num-samples 10 \
     --temperature 0.7
@@ -17,21 +17,24 @@ from contextlib import nullcontext
 import numpy as np
 import torch
 
+from nanogpt.constraints import CrystalConstraintBuilder
 from nanogpt.model import GPTConfig, GPT
 from nanogpt.vocab import decode_token_ids, get_stoi_itos, load_meta
 
 # -----------------------------------------------------------------------------
 init_from = 'resume'
-out_dir = 'out'
-num_samples = 10
+out_dir = os.path.join('..','out')
+num_samples = 5
 max_new_tokens = 100  # maximum generated length (tokens)
-temperature = 0.5
-top_k = 20
+temperature = 0.2
+top_k = 30
 seed = 42
 device = 'cuda'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
 compile = False
-data_dir = os.path.join('data', 'cst', 'test_out')
+data_dir = os.path.join('..','data', 'cst', 'out')
+# Set to False to disable constrained decoding during sampling.
+use_constraints = True
 # -----------------------------------------------------------------------------
 
 torch.manual_seed(seed)
@@ -47,6 +50,7 @@ stoi, itos = get_stoi_itos(meta)
 pad_token = meta.get("pad_token")
 bos_token = meta.get("bos_token") or "[BOS]"
 eos_token = meta.get("eos_token") or "[EOS]"
+constraint_builder = CrystalConstraintBuilder.from_meta(meta) if use_constraints else None
 
 if bos_token not in stoi:
     raise KeyError(f"Start token {bos_token!r} is missing from the vocabulary.")
@@ -94,6 +98,8 @@ def generate_from_embedding(
 
     with torch.no_grad():
         with ctx:
+            constraint_state = constraint_builder.new_state(start_tokens[0].tolist()) if constraint_builder else None
+            constraint_list = [constraint_state] if constraint_state is not None else None
             generated_ids = model.generate(
                 idx=start_tokens,
                 embeddings=embedding_tensor,
@@ -101,6 +107,7 @@ def generate_from_embedding(
                 temperature=temperature,
                 top_k=top_k,
                 eos_token=eos_token_id,
+                constraints=constraint_list,
             )
 
     return _decode(generated_ids[0].tolist())
