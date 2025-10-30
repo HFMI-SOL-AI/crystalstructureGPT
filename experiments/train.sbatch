@@ -1,25 +1,20 @@
 #!/bin/bash
-#SBATCH --account=westai0036
+#SBATCH --account=solai
 #SBATCH --nodes=1
-#SBATCH --time=6:00:00
-#SBATCH --partition=dc-hwai
-#SBATCH --output=/p/project1/hai_solaihack/chandran1/nanoGPT/train-%j.out
-#SBATCH --error=/p/project1/hai_solaihack/chandran1/nanoGPT/train-%j.err
+#SBATCH --time=12:00:00
+#SBATCH --partition=booster
+#SBATCH --output=/p/project1/solai/chandran1/structureGPT/train-%j.out
+#SBATCH --error=/p/project1/solai/chandran1/structureGPT/train-%j.err
 
-# export TOKENIZERS_PARALLELISM=false
-# export TRANSFORMERS_OFFLINE=1
+export TOKENIZERS_PARALLELISM=false
+export TRANSFORMERS_OFFLINE=1
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export WANDB_MODE=offline
 
-# MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)"
-# export MASTER_ADDR="${MASTER_ADDR}i"
-#
-source /p/project1/hai_solaihack/chandran1/nanoGPT/.venv/bin/activate
-cd /p/project1/hai_solaihack/chandran1/nanoGPT/
-python data/cst/prepare.py --input /path/to/your_dataset.pkl --embedding-key embeddings --structure-key cif_path --structure-format cif_path
+MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)"
+export MASTER_ADDR="${MASTER_ADDR}i"
 
-# srun --gres=gpu:4 --nodes=${SLURM_JOB_NUM_NODES} --ntasks-per-node=4 --cpu-bind=none bash -c "
-#     export CUDA_VISIBLE_DEVICES='0,1,2,3'
-#     export PYTHONPATH=''
-#     source /p/project1/hai_solaihack/chandran1/nanoGPT/.venv/bin/activate
-#     cd /p/project1/hai_solaihack/chandran1/nanoGPT/
-#     python data/cst/prepare.py --input /path/to/your_dataset.pkl --embedding-key embeddings --structure-key cif_path --structure-format cif_path
-# "
+cd /p/project1/solai/chandran1/structureGPT/
+source /p/project1/solai/chandran1/structureGPT/.venv/bin/activate
+# python src/nanogpt/train.py --eval_interval=30 --dataset=cst/out --batch_size=256 --block_size=128 --compile=False
+torchrun --standalone --nproc_per_node=4 src/nanogpt/train.py --eval_interval=30 --dataset=cst/out --batch_size=128 --block_size=128 --compile=False
