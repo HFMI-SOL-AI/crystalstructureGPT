@@ -42,7 +42,7 @@ log_interval = 1
 eval_iters = 300
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'resume' # 'scratch' or 'resume' or 'gpt2*'
+init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
@@ -60,7 +60,7 @@ dropout = 0.1 # encourage regularisation on crystal data
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 1e-4 # max learning rate tuned for crystal data
-max_iters =  3_000 #600_000 # total number of training iterations
+max_iters =  4_000 #600_000 # total number of training iterations
 weight_decay = 5e-2
 beta1 = 0.9
 beta2 = 0.95
@@ -71,6 +71,7 @@ warmup_iters = 1000 # how many steps to warm up for
 lr_decay_iters = max_iters # align decay schedule with training horizon
 min_lr = 2e-5 # minimum learning rate
 ordinal_sigma = 1.5 # standard deviation for Gaussian smoothing of ordinal targets
+use_ordinal_smoothing=True # whether to use ordinal smoothing for ordinal targets
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
@@ -192,7 +193,8 @@ model_args = dict(
     vocab_size=vocab_size,
     dropout=dropout,
     embedding_dim=embedding_dim,
-    ordinal_sigma=ordinal_sigma
+    ordinal_sigma=ordinal_sigma,
+    use_ordinal_smoothing=use_ordinal_smoothing,
 ) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch

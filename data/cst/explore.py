@@ -30,7 +30,8 @@ def main() -> None:
     df = df.dropna()
     print(df.shape)
 
-    print(df.head(1)["structure_cif"].values[0])
+    print(df.head(1)["structure_id"].values[0])
+    print(df.head(1)["structure_tokens"].values[0])
 
 
 if __name__ == "__main__":

@@ -44,18 +44,18 @@ class EvalResult:
     embedding_index: int
     exact_match: bool
     spacegroup_match: bool
-    wyckoff_match: bool
     lattice_rmse: float
     frac_rmse: float | None
     composition_match: bool
+    composition_l1: float | None
     length_sq_error: np.ndarray | None
     angle_sq_error: np.ndarray | None
     frac_sq_error: np.ndarray | None
     frac_count: int
 
     @property
-    def core_triplet_match(self) -> bool:
-        return self.spacegroup_match and self.wyckoff_match and self.composition_match
+    def core_match(self) -> bool:
+        return self.spacegroup_match and self.composition_match
 
 
 def parse_args() -> argparse.Namespace:
@@ -109,11 +109,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable constrained decoding and fall back to unconstrained sampling.",
     )
-    parser.add_argument(
-        "--force-sg",
-        action="store_true",
-        help="Seed generation with the ground-truth spacegroup token to assess upper-bound performance.",
-    )
     return parser.parse_args()
 
 
@@ -145,6 +140,14 @@ def _structure_from_tokens(tokens: list[str], cfg: TokenizerConfig) -> Structure
     return conventional
 
 
+def _composition_distance(struct_a: Structure, struct_b: Structure) -> float:
+    """Return L1 distance between fractional compositions."""
+    comp_a = struct_a.composition.fractional_composition.get_el_amt_dict()
+    comp_b = struct_b.composition.fractional_composition.get_el_amt_dict()
+    elements = set(comp_a) | set(comp_b)
+    return float(sum(abs(comp_a.get(el, 0.0) - comp_b.get(el, 0.0)) for el in elements))
+
+
 def evaluate(args: argparse.Namespace) -> list[EvalResult]:
     data_dir = args.data_dir
     cache = np.load(data_dir / f"{args.split}.npy", allow_pickle=True).item()
@@ -173,25 +176,7 @@ def evaluate(args: argparse.Namespace) -> list[EvalResult]:
     for idx in tqdm.tqdm(range(num_samples), desc="Evaluating samples"):
         cond = torch.tensor(embeddings[idx]).float().unsqueeze(0).to(args.device)
 
-        if args.force_sg:
-            prefix_ids: list[int] = []
-            seen_sg = False
-            for token_id in token_ids[idx]:
-                token_int = int(token_id)
-                token = itos.get(token_int)
-                if token is None:
-                    continue
-                prefix_ids.append(token_int)
-                if token.startswith("[SG:"):
-                    seen_sg = True
-                    break
-            if not prefix_ids or not itos.get(prefix_ids[0], "").startswith("[BOS]"):
-                prefix_ids.insert(0, stoi[bos_token])
-            if not seen_sg:
-                # fallback to BOS only if SG token missing
-                prefix_ids = [stoi[bos_token]]
-        else:
-            prefix_ids = [stoi[bos_token]]
+        prefix_ids = [stoi[bos_token]]
 
         start = torch.tensor([prefix_ids], dtype=torch.long, device=args.device)
         with torch.no_grad():
@@ -229,17 +214,13 @@ def evaluate(args: argparse.Namespace) -> list[EvalResult]:
         gt_struct = _structure_from_tokens(reference_tokens, tokenizer_cfg)
 
         composition_match = False
+        composition_l1 = None
 
         if gen_struct is not None and gt_struct is not None:
             try:
                 sg_match = gen_struct.get_space_group_info()[0] == gt_struct.get_space_group_info()[0]
             except Exception:
                 sg_match = False
-            wyckoff_match = [
-                tok for tok in generated_tokens if tok.startswith("[WY:")
-            ] == [
-                tok for tok in reference_tokens if tok.startswith("[WY:")
-            ]
             lattice_rmse = _rmse(gen_struct.lattice.parameters, gt_struct.lattice.parameters)
             params_gen = np.array(gen_struct.lattice.parameters, dtype=np.float64)
             params_gt = np.array(gt_struct.lattice.parameters, dtype=np.float64)
@@ -267,27 +248,29 @@ def evaluate(args: argparse.Namespace) -> list[EvalResult]:
                     gen_struct.composition.reduced_formula
                     == gt_struct.composition.reduced_formula
                 )
+                composition_l1 = _composition_distance(gen_struct, gt_struct)
             except Exception:
                 composition_match = False
+                composition_l1 = None
         else:
             sg_match = False
-            wyckoff_match = False
             lattice_rmse = float("nan")
             frac_rmse = None
             length_sq_err = None
             angle_sq_err = None
             frac_sq_err = None
             frac_count = 0
+            composition_l1 = None
 
         results.append(
             EvalResult(
                 embedding_index=idx,
                 exact_match=exact,
                 spacegroup_match=sg_match,
-                wyckoff_match=wyckoff_match,
                 lattice_rmse=lattice_rmse,
                 frac_rmse=frac_rmse,
                 composition_match=composition_match,
+                composition_l1=composition_l1,
                 length_sq_error=length_sq_err,
                 angle_sq_error=angle_sq_err,
                 frac_sq_error=frac_sq_err,
@@ -305,11 +288,11 @@ def main() -> None:
     total = len(results)
     exact = sum(r.exact_match for r in results)
     sg = sum(r.spacegroup_match for r in results)
-    wy = sum(r.wyckoff_match for r in results)
     comp = sum(r.composition_match for r in results)
-    triplet = sum(r.core_triplet_match for r in results)
+    joint = sum(r.core_match for r in results)
     lattice_errors = np.array([r.lattice_rmse for r in results], dtype=float)
     frac_errors = [r.frac_rmse for r in results if r.frac_rmse is not None]
+    comp_l1_errors = [r.composition_l1 for r in results if r.composition_l1 is not None]
 
     length_sq_sum = np.zeros(3, dtype=np.float64)
     angle_sq_sum = np.zeros(3, dtype=np.float64)
@@ -334,20 +317,22 @@ def main() -> None:
     valid_total = len(valid_results)
     valid_exact = sum(r.exact_match for r in valid_results)
     valid_sg = sum(r.spacegroup_match for r in valid_results)
-    valid_wy = sum(r.wyckoff_match for r in valid_results)
     valid_lattice = lattice_errors[valid_mask]
     valid_frac = [r.frac_rmse for r in valid_results if r.frac_rmse is not None]
-    valid_triplet = sum(r.core_triplet_match for r in valid_results)
+    valid_joint = sum(r.core_match for r in valid_results)
+    valid_comp_l1 = [r.composition_l1 for r in valid_results if r.composition_l1 is not None]
 
     print(f"Samples evaluated: {total}")
     print(f"Exact structural match: {exact / total:.2%}")
     print(f"Spacegroup match:       {sg / total:.2%}")
-    print(f"Wyckoff sequence match: {wy / total:.2%}")
     print(f"Lattice RMSE (mean):    {np.nanmean(lattice_errors):.4f}")
     if frac_errors:
         print(f"Fractional RMSE (mean): {np.mean(frac_errors):.4f}")
     print(f"Composition match:      {comp / total:.2%}")
-    print(f"Composition+SG+Wyckoff: {triplet / total:.2%}")
+    print(f"Composition+SG match:   {joint / total:.2%}")
+    if comp_l1_errors:
+        print(f"Composition L1 distance (mean):   {np.mean(comp_l1_errors):.4f}")
+        print(f"Composition L1 distance (median): {np.median(comp_l1_errors):.4f}")
     if length_count > 0:
         length_rmse = np.sqrt(length_sq_sum / length_count)
         print(f"Lattice RMSE per axis (a,b,c):       {length_rmse}")
@@ -363,13 +348,15 @@ def main() -> None:
         print(f"Valid samples:          {valid_total}")
         print(f"Exact structural match: {valid_exact / valid_total:.2%}")
         print(f"Spacegroup match:       {valid_sg / valid_total:.2%}")
-        print(f"Wyckoff sequence match: {valid_wy / valid_total:.2%}")
         print(f"Lattice RMSE (mean):    {valid_lattice.mean():.4f}")
         if valid_frac:
             print(f"Fractional RMSE (mean): {np.mean(valid_frac):.4f}")
         valid_comp = sum(r.composition_match for r in valid_results)
         print(f"Composition match:      {valid_comp / valid_total:.2%}")
-        print(f"Composition+SG+Wyckoff: {valid_triplet / valid_total:.2%}")
+        print(f"Composition+SG match:   {valid_joint / valid_total:.2%}")
+        if valid_comp_l1:
+            print(f"Composition L1 distance (valid mean):   {np.mean(valid_comp_l1):.4f}")
+            print(f"Composition L1 distance (valid median): {np.median(valid_comp_l1):.4f}")
         if length_count > 0:
             print(f"Lattice RMSE per axis (valid):       {length_rmse}")
         if angle_count > 0:

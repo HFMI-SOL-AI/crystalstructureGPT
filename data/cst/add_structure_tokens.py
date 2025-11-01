@@ -32,8 +32,8 @@ warnings.filterwarnings(
 
 
 _CUSTOM_BINS = BinConfig(
-    L_bins=512,
-    A_bins=512,
+    L_bins=128,
+    A_bins=128,
     F_bins=1024,
     a_lo=0.6,
     a_hi=31.4,

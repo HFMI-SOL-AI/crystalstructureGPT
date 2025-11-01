@@ -75,6 +75,12 @@ def parse_args() -> argparse.Namespace:
         default=1337,
         help="Random seed for shuffling before the train/val split.",
     )
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=0,
+        help="Maximum allowed token sequence length; <= 0 keeps all samples.",
+    )
     return parser.parse_args()
 
 
@@ -195,7 +201,6 @@ def build_vocab(
         "[fx:",
         "[fy:",
         "[fz:",
-        "[Count:",
     ]
     ordinal_tokens: Dict[str, Dict[str, float]] = {
         prefix: {} for prefix in ordinal_prefixes
@@ -264,8 +269,8 @@ def main() -> None:
         )
 
     custom_bins = BinConfig(
-         L_bins=512,
-         A_bins=512,
+         L_bins=128,
+         A_bins=128,
          F_bins=1024,
          a_lo=0.6,
          a_hi=31.4,
@@ -286,6 +291,19 @@ def main() -> None:
     sequences, tokenizer_config, tokenizer_version = load_token_sequences(
         df[args.structure_key], args.structure_format, tokenizer_cfg
     )
+
+    max_length = args.max_length
+    if max_length and max_length > 0:
+        keep_mask = np.array([len(seq) <= max_length for seq in sequences], dtype=bool)
+        dropped = int(len(sequences) - keep_mask.sum())
+        if dropped > 0:
+            print(f"Dropped {dropped} samples longer than {max_length} tokens.")
+        sequences = [seq for seq, keep in zip(sequences, keep_mask) if keep]
+        embeddings = embeddings[keep_mask]
+        df = df.iloc[keep_mask].reset_index(drop=True)
+        if not sequences:
+            raise ValueError("All samples were dropped by the max-length filter.")
+
     vocab_list, stoi, ordinal_metadata = build_vocab(sequences)
     token_ids = encode_sequences(sequences, stoi)
 
@@ -304,6 +322,9 @@ def main() -> None:
 
     train_data = subset(train_idx)
     val_data = subset(val_idx)
+
+    print(f"Training samples:   {len(train_idx)}")
+    print(f"Validation samples: {len(val_idx)}")
 
     meta = {
         "vocab_size": len(vocab_list),
