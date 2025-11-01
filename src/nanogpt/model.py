@@ -19,6 +19,9 @@ from torch.nn import functional as F
 if TYPE_CHECKING:
     from .constraints import CrystalConstraintState
 
+
+ANGLE_GROUPS = {'alpha', 'beta', 'gamma'}
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -119,6 +122,9 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     embedding_dim: int = 256
+    use_ordinal_smoothing: bool = True # Use Gaussian smoothing for ordinal tokens (lattice, coords)
+    ordinal_sigma: float = 2.0 # Gaussian width for ordinal smoothing
+    angle_sigma_multiplier: float = 2.0 # Extra smoothing for angle tokens
 
 class GPT(nn.Module):
 
@@ -139,6 +145,14 @@ class GPT(nn.Module):
         self.emb_proj = nn.Linear(self.embedding_dim, config.n_embd)  # Project embeddings to model dimension
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+
+        # Ordinal token groups for Gaussian smoothing (will be set from metadata)
+        self.ordinal_token_groups = None
+        self.ordinal_token_mask = None
+        self.ordinal_id_to_group = None
+        self.ordinal_lookup_group = None
+        self.ordinal_lookup_offset = None
+        self.ordinal_group_names = None
 
         # init all weights
         self.apply(self._init_weights)
@@ -170,6 +184,248 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def setup_ordinal_tokens(self, itos, ordinal_metadata=None):
+        """
+        Setup ordinal token groups from vocabulary for Gaussian smoothing.
+        Should be called after model initialization with the vocabulary.
+
+        Args:
+            itos: List or dict mapping token IDs to token strings
+            ordinal_metadata: Optional metadata describing ordinal token blocks
+        """
+        if not self.config.use_ordinal_smoothing:
+            return
+
+        # Handle both list and dict formats
+        if isinstance(itos, dict):
+            # Convert dict to list format: {0: 'token0', 1: 'token1', ...} -> ['token0', 'token1', ...]
+            itos_list = [itos[i] for i in range(len(itos))]
+        else:
+            itos_list = itos
+
+        # Ordinal parameters: lattice parameters and fractional coordinates
+        ordinal_prefixes = ['[a:', '[b/a:', '[c/a:', '[alpha:', '[beta:', '[gamma:', '[fx:', '[fy:', '[fz:']
+
+        # Group tokens by parameter type
+        ordinal_groups = {}
+        ordinal_id_to_group = {}
+        parsing_issues = []
+
+        if ordinal_metadata:
+            for name, group_meta in ordinal_metadata.items():
+                try:
+                    start = int(group_meta.get('start', 0))
+                    size = int(group_meta.get('size', 0))
+                except (TypeError, ValueError):
+                    continue
+                if size <= 0:
+                    continue
+                sorted_ids = list(range(start, min(start + size, len(itos_list))))
+                if not sorted_ids:
+                    continue
+                values_meta = group_meta.get('values', [])
+                values = []
+                prefix = f'[{name}:'
+                for idx, token_id in enumerate(sorted_ids):
+                    value = None
+                    if idx < len(values_meta):
+                        try:
+                            value = float(values_meta[idx])
+                        except (TypeError, ValueError):
+                            value = None
+                    if value is None:
+                        token = itos_list[token_id]
+                        value = self._parse_ordinal_value(token, prefix)
+                    if value is None:
+                        parsing_issues.append(itos_list[token_id])
+                        value = float(idx)
+                    values.append(value)
+                ordinal_groups[name] = {
+                    'sorted_ids': sorted_ids,
+                    'values': values,
+                    'start': sorted_ids[0],
+                    'end': sorted_ids[-1],
+                    'size': len(sorted_ids),
+                    'range': (values[-1] - values[0] + (values[1] - values[0] if len(values) > 1 else 0.0)) if values else 0.0,
+                }
+                for idx, token_id in enumerate(sorted_ids):
+                    ordinal_id_to_group[token_id] = (name, idx)
+
+        # Fallback: derive from tokens if metadata not provided or incomplete
+        if not ordinal_groups:
+            for prefix in ordinal_prefixes:
+                token_entries = []
+                for token_id, token in enumerate(itos_list):
+                    if token.startswith(prefix):
+                        value = self._parse_ordinal_value(token, prefix)
+                        if value is None:
+                            parsing_issues.append(token)
+                            continue
+                        token_entries.append((token_id, value))
+                if token_entries:
+                    token_entries.sort(key=lambda x: x[1])
+                    sorted_ids = [token_id for token_id, _ in token_entries]
+                    values = [value for _, value in token_entries]
+                    param_name = prefix[1:-1]  # Remove [ and :
+                    ordinal_groups[param_name] = {
+                        'sorted_ids': sorted_ids,
+                        'values': values,
+                        'start': min(sorted_ids),
+                        'end': max(sorted_ids),
+                        'size': len(sorted_ids),
+                        'range': (values[-1] - values[0] + (values[1] - values[0] if len(values) > 1 else 0.0)) if values else 0.0,
+                    }
+                    for idx, token_id in enumerate(sorted_ids):
+                        ordinal_id_to_group[token_id] = (param_name, idx)
+
+        self.ordinal_token_groups = ordinal_groups
+
+        vocab_size = self.config.vocab_size
+        lookup_group = torch.full((vocab_size,), -1, dtype=torch.long)
+        lookup_offset = torch.full((vocab_size,), -1, dtype=torch.long)
+        group_names = sorted(ordinal_groups.keys())
+        for group_idx, name in enumerate(group_names):
+            group_info = ordinal_groups[name]
+            sorted_ids = group_info['sorted_ids']
+            if not sorted_ids:
+                continue
+            base_id = sorted_ids[0]
+            is_contiguous = all(token_id == base_id + offset for offset, token_id in enumerate(sorted_ids))
+            group_info['contiguous'] = is_contiguous
+            group_info['group_idx'] = group_idx
+            group_info['values_tensor'] = torch.tensor(group_info['values'], dtype=torch.float32)
+            if is_contiguous:
+                start = group_info['start']
+                size = group_info['size']
+                lookup_group[start:start + size] = group_idx
+                lookup_offset[start:start + size] = torch.arange(size, dtype=torch.long)
+            else:
+                for local_idx, token_id in enumerate(sorted_ids):
+                    if token_id < vocab_size:
+                        lookup_group[token_id] = group_idx
+                        lookup_offset[token_id] = local_idx
+            for local_idx, token_id in enumerate(sorted_ids):
+                if token_id < vocab_size:
+                    ordinal_id_to_group[token_id] = (name, local_idx)
+
+        ordinal_mask = lookup_group >= 0
+        self.ordinal_token_mask = ordinal_mask
+        self.ordinal_id_to_group = ordinal_id_to_group
+        self.ordinal_lookup_group = lookup_group
+        self.ordinal_lookup_offset = lookup_offset
+        self.ordinal_group_names = group_names
+
+        print(f"Ordinal smoothing enabled: {len(ordinal_groups)} parameter types, "
+              f"{ordinal_mask.sum().item()} total ordinal tokens")
+        if parsing_issues:
+            unique_issues = sorted(set(parsing_issues))
+            print(f"Warning: failed to parse ordinal values for {len(unique_issues)} tokens; "
+                  f"these will fall back to categorical targets.")
+
+    @staticmethod
+    def _parse_ordinal_value(token: str, prefix: str) -> Optional[float]:
+        """Extract the numeric value encoded in an ordinal token."""
+        try:
+            suffix = token[len(prefix):]
+            if suffix.endswith(']'):
+                suffix = suffix[:-1]
+            return float(suffix)
+        except (ValueError, TypeError):
+            return None
+
+    def compute_smoothed_losses(self, targets, log_probs):
+        """
+        Compute per-token loss terms using Gaussian-smoothed soft targets for ordinal tokens.
+
+        Args:
+            targets: Target token IDs [batch_size * seq_len]
+            log_probs: Log-probabilities for each token [batch_size * seq_len, vocab_size]
+
+        Returns:
+            loss_terms: Loss value for each token position [batch_size * seq_len]
+        """
+        if not self.config.use_ordinal_smoothing or self.ordinal_token_groups is None:
+            # Fall back to one-hot negative log likelihood
+            negative_log_likelihood = torch.zeros_like(targets, dtype=log_probs.dtype, device=log_probs.device)
+            valid_indices = torch.nonzero(targets >= 0, as_tuple=False).squeeze(-1)
+            if valid_indices.numel() > 0:
+                negative_log_likelihood[valid_indices] = -log_probs[valid_indices, targets[valid_indices]]
+            return negative_log_likelihood
+
+        device = log_probs.device
+
+        # Ensure lookup tensors are on the correct device
+        if self.ordinal_lookup_group is None or self.ordinal_lookup_offset is None:
+            raise RuntimeError("Ordinal lookups are not initialised. Call setup_ordinal_tokens first.")
+
+        if self.ordinal_lookup_group.device != device:
+            self.ordinal_lookup_group = self.ordinal_lookup_group.to(device)
+        if self.ordinal_lookup_offset.device != device:
+            self.ordinal_lookup_offset = self.ordinal_lookup_offset.to(device)
+        if self.ordinal_token_mask.device != device:
+            self.ordinal_token_mask = self.ordinal_token_mask.to(device)
+
+        loss_terms = torch.zeros_like(targets, dtype=log_probs.dtype, device=device)
+        valid_mask = targets >= 0
+        if not valid_mask.any():
+            return loss_terms
+
+        targets_safe = targets.clone()
+        targets_safe[~valid_mask] = 0
+
+        group_indices = self.ordinal_lookup_group[targets_safe]
+        local_offsets = self.ordinal_lookup_offset[targets_safe]
+
+        # Categorical tokens (non-ordinal)
+        categorical_mask = valid_mask & (group_indices < 0)
+        categorical_indices = torch.nonzero(categorical_mask, as_tuple=False).squeeze(-1)
+        if categorical_indices.numel() > 0:
+            loss_terms[categorical_indices] = -log_probs[categorical_indices, targets[categorical_indices]]
+
+        # Process ordinal groups
+        for group_idx, name in enumerate(self.ordinal_group_names or []):
+            group_info = self.ordinal_token_groups[name]
+            positions = torch.nonzero(valid_mask & (group_indices == group_idx), as_tuple=False).squeeze(-1)
+            if positions.numel() == 0:
+                continue
+
+            values_tensor = group_info['values_tensor']
+            if values_tensor.device != device:
+                values_tensor = values_tensor.to(device)
+                group_info['values_tensor'] = values_tensor
+
+            group_sigma = self.config.ordinal_sigma
+            if name in ANGLE_GROUPS:
+                group_sigma = group_sigma * self.config.angle_sigma_multiplier
+
+            target_values = values_tensor[local_offsets[positions]]
+            distances = torch.abs(values_tensor.unsqueeze(0) - target_values.unsqueeze(1))
+            if name in ANGLE_GROUPS:
+                value_range = float(group_info.get('range', 0.0))
+                if value_range > 0:
+                    range_tensor = values_tensor.new_tensor(value_range)
+                    wrapped = torch.abs(range_tensor - distances)
+                    distances = torch.minimum(distances, wrapped)
+            weights = torch.exp(-((distances ** 2) / (2 * group_sigma ** 2)))
+            weight_sums = weights.sum(dim=1, keepdim=True)
+            weight_sums = torch.where(weight_sums == 0, torch.ones_like(weight_sums), weight_sums)
+            weights = weights / weight_sums
+
+            if group_info.get('contiguous', False):
+                start = group_info['start']
+                size = group_info['size']
+                logits_slice = log_probs[positions, start:start + size]
+            else:
+                sorted_ids_tensor = group_info.get('sorted_ids_tensor')
+                if sorted_ids_tensor is None or sorted_ids_tensor.device != device:
+                    sorted_ids_tensor = torch.tensor(group_info['sorted_ids'], dtype=torch.long, device=device)
+                    group_info['sorted_ids_tensor'] = sorted_ids_tensor
+                logits_slice = log_probs[positions][:, sorted_ids_tensor]
+
+            loss_terms[positions] = -(weights * logits_slice).sum(dim=1)
+
+        return loss_terms
+
     def forward(self, idx, targets=None, embeddings=None):
         device = idx.device
         b, t = idx.size()
@@ -195,7 +451,24 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
+            if self.config.use_ordinal_smoothing and self.ordinal_token_groups is not None:
+                # Use soft targets with Gaussian smoothing for ordinal tokens
+                targets_flat = targets.view(-1)
+                logits_flat = logits.view(-1, logits.size(-1))
+
+                # Apply log_softmax to logits
+                log_probs = F.log_softmax(logits_flat, dim=-1)
+
+                # Compute per-token losses
+                loss_terms = self.compute_smoothed_losses(targets_flat, log_probs)
+
+                # Mask out padding tokens (target_id == -1)
+                mask = targets_flat != -1
+                loss = loss_terms[mask].mean()
+            else:
+                # Standard cross-entropy loss
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim

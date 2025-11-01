@@ -16,7 +16,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 
 Example Usage:
-    python src/nanogpt/train.py --eval_interval=10 --dataset=cst/test_out --batch_size=128 --block_size=128 --compile=False
+    python src/nanogpt/train.py --eval_interval=10 --dataset=cst/out --batch_size=128 --block_size=128 --compile=False
 """
 
 import os
@@ -49,27 +49,28 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'cst'
-gradient_accumulation_steps = 4 # used to simulate larger batch sizes
+gradient_accumulation_steps = 8 # used to simulate larger batch sizes
 batch_size = 16 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
-n_layer = 12
-n_head = 12
-n_embd = 768
+n_layer = 16
+n_head = 16
+n_embd = 1024
 dropout = 0.1 # encourage regularisation on crystal data
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
-learning_rate = 2e-4 # max learning rate tuned for crystal data
-max_iters =  8_000 #600_000 # total number of training iterations
-weight_decay = 1e-1
+learning_rate = 1e-4 # max learning rate tuned for crystal data
+max_iters =  3_000 #600_000 # total number of training iterations
+weight_decay = 5e-2
 beta1 = 0.9
 beta2 = 0.95
-grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+grad_clip = 0.5 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 200 # how many steps to warm up for
+warmup_iters = 1000 # how many steps to warm up for
 lr_decay_iters = max_iters # align decay schedule with training horizon
-min_lr = 5e-6 # minimum learning rate
+min_lr = 2e-5 # minimum learning rate
+ordinal_sigma = 1.5 # standard deviation for Gaussian smoothing of ordinal targets
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
@@ -140,6 +141,7 @@ stoi, itos = get_stoi_itos(meta)
 pad_token_id = meta.get("pad_token_id", 0)
 embedding_dim = meta.get("embedding_dim", train_cache["embeddings"].shape[1])
 vocab_size = meta.get("vocab_size", len(itos))
+ordinal_metadata = meta.get("ordinal_metadata")
 
 
 def _select_cache(split: str):
@@ -189,7 +191,8 @@ model_args = dict(
     bias=bias,
     vocab_size=vocab_size,
     dropout=dropout,
-    embedding_dim=embedding_dim
+    embedding_dim=embedding_dim,
+    ordinal_sigma=ordinal_sigma
 ) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
@@ -200,6 +203,8 @@ if init_from == 'scratch':
         model_args['vocab_size'] = 50304
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
+    # Setup ordinal tokens for Gaussian smoothing
+    model.setup_ordinal_tokens(itos, ordinal_metadata)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -223,6 +228,8 @@ elif init_from == 'resume':
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+    # Setup ordinal tokens for Gaussian smoothing
+    model.setup_ordinal_tokens(itos, ordinal_metadata)
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
