@@ -91,7 +91,9 @@ def tokenize_cifs(
     total = len(cif_strings)
     desc = "Tokenising CIFs"
     if workers <= 1:
-        return [cif_to_tokens(cif) for cif in tqdm(cif_strings, desc=desc, unit="structure")]
+        return [
+            cif_to_tokens(cif) for cif in tqdm(cif_strings, desc=desc, unit="structure")
+        ]
 
     with ProcessPoolExecutor(max_workers=workers) as pool:
         iterator = pool.map(cif_to_tokens, cif_strings, chunksize=max(1, chunksize))

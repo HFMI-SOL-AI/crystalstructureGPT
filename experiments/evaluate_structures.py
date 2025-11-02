@@ -127,7 +127,9 @@ def _build_tokenizer_config(meta: dict) -> TokenizerConfig:
     default_cfg = TokenizerConfig()
     return TokenizerConfig(
         symprec=cfg_dict.get("symprec", getattr(default_cfg, "symprec", 1e-3)),
-        angle_tolerance=cfg_dict.get("angle_tolerance", getattr(default_cfg, "angle_tolerance", 5.0)),
+        angle_tolerance=cfg_dict.get(
+            "angle_tolerance", getattr(default_cfg, "angle_tolerance", 5.0)
+        ),
         bins=bins,
     )
 
@@ -155,7 +157,9 @@ def evaluate(args: argparse.Namespace) -> list[EvalResult]:
     meta = load_meta(data_dir)
     stoi, itos = get_stoi_itos(meta)
     tokenizer_cfg = _build_tokenizer_config(meta)
-    constraint_builder = None if args.no_constraints else CrystalConstraintBuilder.from_meta(meta)
+    constraint_builder = (
+        None if args.no_constraints else CrystalConstraintBuilder.from_meta(meta)
+    )
     bos_token = meta.get("bos_token") or "[BOS]"
     eos_token_id = stoi.get(meta.get("eos_token") or "[EOS]")
     eos_token = meta.get("eos_token") or "[EOS]"
@@ -187,7 +191,11 @@ def evaluate(args: argparse.Namespace) -> list[EvalResult]:
                 temperature=args.temperature,
                 top_k=args.top_k,
                 eos_token=eos_token_id,
-                constraints=[constraint_builder.new_state(start[0].tolist())] if constraint_builder else None,
+                constraints=(
+                    [constraint_builder.new_state(start[0].tolist())]
+                    if constraint_builder
+                    else None
+                ),
             )[0].tolist()
 
         gt_ids = token_ids[idx]
@@ -218,10 +226,15 @@ def evaluate(args: argparse.Namespace) -> list[EvalResult]:
 
         if gen_struct is not None and gt_struct is not None:
             try:
-                sg_match = gen_struct.get_space_group_info()[0] == gt_struct.get_space_group_info()[0]
+                sg_match = (
+                    gen_struct.get_space_group_info()[0]
+                    == gt_struct.get_space_group_info()[0]
+                )
             except Exception:
                 sg_match = False
-            lattice_rmse = _rmse(gen_struct.lattice.parameters, gt_struct.lattice.parameters)
+            lattice_rmse = _rmse(
+                gen_struct.lattice.parameters, gt_struct.lattice.parameters
+            )
             params_gen = np.array(gen_struct.lattice.parameters, dtype=np.float64)
             params_gt = np.array(gt_struct.lattice.parameters, dtype=np.float64)
             length_sq_err = (params_gen[:3] - params_gt[:3]) ** 2
@@ -320,7 +333,9 @@ def main() -> None:
     valid_lattice = lattice_errors[valid_mask]
     valid_frac = [r.frac_rmse for r in valid_results if r.frac_rmse is not None]
     valid_joint = sum(r.core_match for r in valid_results)
-    valid_comp_l1 = [r.composition_l1 for r in valid_results if r.composition_l1 is not None]
+    valid_comp_l1 = [
+        r.composition_l1 for r in valid_results if r.composition_l1 is not None
+    ]
 
     print(f"Samples evaluated: {total}")
     print(f"Exact structural match: {exact / total:.2%}")
@@ -355,8 +370,12 @@ def main() -> None:
         print(f"Composition match:      {valid_comp / valid_total:.2%}")
         print(f"Composition+SG match:   {valid_joint / valid_total:.2%}")
         if valid_comp_l1:
-            print(f"Composition L1 distance (valid mean):   {np.mean(valid_comp_l1):.4f}")
-            print(f"Composition L1 distance (valid median): {np.median(valid_comp_l1):.4f}")
+            print(
+                f"Composition L1 distance (valid mean):   {np.mean(valid_comp_l1):.4f}"
+            )
+            print(
+                f"Composition L1 distance (valid median): {np.median(valid_comp_l1):.4f}"
+            )
         if length_count > 0:
             print(f"Lattice RMSE per axis (valid):       {length_rmse}")
         if angle_count > 0:

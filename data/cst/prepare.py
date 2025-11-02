@@ -269,18 +269,20 @@ def main() -> None:
         )
 
     custom_bins = BinConfig(
-         L_bins=128,
-         A_bins=128,
-         F_bins=1024,
-         a_lo=0.6,
-         a_hi=31.4,
-         ang_lo=55.0,
-         ang_hi=125.0,
-     )
+        L_bins=128,
+        A_bins=128,
+        F_bins=1024,
+        a_lo=0.6,
+        a_hi=31.4,
+        ang_lo=55.0,
+        ang_hi=125.0,
+    )
 
-    tokenizer_cfg = TokenizerConfig(symprec=DEFAULT_CONFIG.symprec,
-                           angle_tolerance=DEFAULT_CONFIG.angle_tolerance,
-                           bins=custom_bins)
+    tokenizer_cfg = TokenizerConfig(
+        symprec=DEFAULT_CONFIG.symprec,
+        angle_tolerance=DEFAULT_CONFIG.angle_tolerance,
+        bins=custom_bins,
+    )
 
     # tokenizer_cfg = TokenizerConfig(
     #     symprec=args.symprec,
@@ -345,7 +347,9 @@ def main() -> None:
     with open(output_dir / "meta.pkl", "wb") as fh:
         pickle.dump(meta, fh)
 
-    print(f"Wrote {len(train_idx)} training and {len(val_idx)} validation samples to {output_dir}")
+    print(
+        f"Wrote {len(train_idx)} training and {len(val_idx)} validation samples to {output_dir}"
+    )
     print("Vocabulary size:", meta["vocab_size"])
 
 

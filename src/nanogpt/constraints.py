@@ -74,14 +74,10 @@ class CrystalConstraintBuilder:
         self._populate_categories()
 
         self._lattice_sequence = [
-            name
-            for name in self._LATTICE_SEQUENCE
-            if getattr(self._categories, name)
+            name for name in self._LATTICE_SEQUENCE if getattr(self._categories, name)
         ]
         self._site_sequence = [
-            name
-            for name in self._SITE_SEQUENCE
-            if getattr(self._categories, name)
+            name for name in self._SITE_SEQUENCE if getattr(self._categories, name)
         ]
 
     @classmethod
@@ -356,12 +352,16 @@ class CrystalConstraintState:
         self._set_sites_phase()
 
     def _advance_lattice_if_empty(self) -> None:
-        while self._phase == "lattice" and self._lattice_index < len(self._lattice_sequence):
+        while self._phase == "lattice" and self._lattice_index < len(
+            self._lattice_sequence
+        ):
             category = self._lattice_sequence[self._lattice_index]
             if self._builder.category_ids(category):
                 return
             self._lattice_index += 1
-        if self._phase == "lattice" and self._lattice_index >= len(self._lattice_sequence):
+        if self._phase == "lattice" and self._lattice_index >= len(
+            self._lattice_sequence
+        ):
             self._enter_post_lattice_phase()
 
     def _disable(self) -> None:
