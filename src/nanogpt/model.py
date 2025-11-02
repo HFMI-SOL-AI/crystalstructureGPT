@@ -9,6 +9,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 import inspect
+import statistics
 from dataclasses import dataclass
 from typing import Optional, Sequence, TYPE_CHECKING
 
@@ -20,7 +21,14 @@ if TYPE_CHECKING:
     from .constraints import CrystalConstraintState
 
 
+LATTICE_GROUPS = {'a', 'b/a', 'c/a'}
 ANGLE_GROUPS = {'alpha', 'beta', 'gamma'}
+FRACTIONAL_GROUPS = {'fx', 'fy', 'fz'}
+ORDINAL_FAMILY_MAP = {
+    **{name: 'lattice' for name in LATTICE_GROUPS},
+    **{name: 'angle' for name in ANGLE_GROUPS},
+    **{name: 'fractional' for name in FRACTIONAL_GROUPS},
+}
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -123,8 +131,9 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     embedding_dim: int = 256
     use_ordinal_smoothing: bool = True # Use Gaussian smoothing for ordinal tokens (lattice, coords)
-    ordinal_sigma: float = 2.0 # Gaussian width for ordinal smoothing
-    angle_sigma_multiplier: float = 2.0 # Extra smoothing for angle tokens
+    lattice_sigma_bins: float = 1.5 # Gaussian width (in bins) for lattice parameters
+    angle_sigma_bins: float = 1.5 # Gaussian width (in bins) for lattice angles
+    fractional_sigma_bins: float = 0.5 # Gaussian width (in bins) for fractional coordinates
 
 class GPT(nn.Module):
 
@@ -247,6 +256,8 @@ class GPT(nn.Module):
                     'end': sorted_ids[-1],
                     'size': len(sorted_ids),
                     'range': (values[-1] - values[0] + (values[1] - values[0] if len(values) > 1 else 0.0)) if values else 0.0,
+                    'family': ORDINAL_FAMILY_MAP.get(name, 'lattice'),
+                    'bin_width': self._estimate_bin_width(values),
                 }
                 for idx, token_id in enumerate(sorted_ids):
                     ordinal_id_to_group[token_id] = (name, idx)
@@ -274,6 +285,8 @@ class GPT(nn.Module):
                         'end': max(sorted_ids),
                         'size': len(sorted_ids),
                         'range': (values[-1] - values[0] + (values[1] - values[0] if len(values) > 1 else 0.0)) if values else 0.0,
+                        'family': ORDINAL_FAMILY_MAP.get(param_name, 'lattice'),
+                        'bin_width': self._estimate_bin_width(values),
                     }
                     for idx, token_id in enumerate(sorted_ids):
                         ordinal_id_to_group[token_id] = (param_name, idx)
@@ -332,6 +345,26 @@ class GPT(nn.Module):
             return float(suffix)
         except (ValueError, TypeError):
             return None
+
+    @staticmethod
+    def _estimate_bin_width(values: Sequence[float]) -> float:
+        """Estimate the representative spacing between consecutive ordinal values."""
+        if len(values) < 2:
+            return 1.0
+        diffs = [abs(values[idx + 1] - values[idx]) for idx in range(len(values) - 1)]
+        try:
+            width = float(statistics.median(diffs))
+        except statistics.StatisticsError:
+            width = float(diffs[0]) if diffs else 1.0
+        return max(width, 1e-6)
+
+    def _sigma_bins_for_family(self, family: Optional[str]) -> float:
+        """Lookup the configured Gaussian width (in bins) for a token family."""
+        if family == 'angle':
+            return max(self.config.angle_sigma_bins, 1e-6)
+        if family == 'fractional':
+            return max(self.config.fractional_sigma_bins, 1e-6)
+        return max(self.config.lattice_sigma_bins, 1e-6)
 
     def compute_smoothed_losses(self, targets, log_probs):
         """
@@ -394,9 +427,10 @@ class GPT(nn.Module):
                 values_tensor = values_tensor.to(device)
                 group_info['values_tensor'] = values_tensor
 
-            group_sigma = self.config.ordinal_sigma
-            if name in ANGLE_GROUPS:
-                group_sigma = group_sigma * self.config.angle_sigma_multiplier
+            family = group_info.get('family')
+            bin_width = float(group_info.get('bin_width', 1.0))
+            group_sigma_bins = self._sigma_bins_for_family(family)
+            group_sigma = max(group_sigma_bins * max(bin_width, 1e-6), 1e-6)
 
             target_values = values_tensor[local_offsets[positions]]
             distances = torch.abs(values_tensor.unsqueeze(0) - target_values.unsqueeze(1))

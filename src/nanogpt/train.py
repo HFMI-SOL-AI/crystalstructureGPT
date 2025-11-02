@@ -60,17 +60,19 @@ dropout = 0.1 # encourage regularisation on crystal data
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 1e-4 # max learning rate tuned for crystal data
-max_iters =  4_000 #600_000 # total number of training iterations
+max_iters =  2_500 #600_000 # total number of training iterations
 weight_decay = 5e-2
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 0.5 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 1000 # how many steps to warm up for
-lr_decay_iters = max_iters # align decay schedule with training horizon
+warmup_iters = 300 # how many steps to warm up for
+lr_decay_iters = max_iters + int(max_iters/2) # set decay schedule with training horizon
 min_lr = 2e-5 # minimum learning rate
-ordinal_sigma = 1.5 # standard deviation for Gaussian smoothing of ordinal targets
+lattice_sigma_bins = 1.5 # smoothing width (in bins) for lattice parameters
+angle_sigma_bins = 5 # smoothing width (in bins) for lattice angles
+fractional_sigma_bins = 8 # smoothing width (in bins) for fractional coordinates
 use_ordinal_smoothing=True # whether to use ordinal smoothing for ordinal targets
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
@@ -193,7 +195,9 @@ model_args = dict(
     vocab_size=vocab_size,
     dropout=dropout,
     embedding_dim=embedding_dim,
-    ordinal_sigma=ordinal_sigma,
+    lattice_sigma_bins=lattice_sigma_bins,
+    angle_sigma_bins=angle_sigma_bins,
+    fractional_sigma_bins=fractional_sigma_bins,
     use_ordinal_smoothing=use_ordinal_smoothing,
 ) # start with model_args from command line
 if init_from == 'scratch':
