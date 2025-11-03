@@ -56,25 +56,25 @@ block_size = 1024
 n_layer = 16
 n_head = 16
 n_embd = 1024
-dropout = 0.1  # encourage regularisation on crystal data
+dropout = 0.0  # encourage regularisation on crystal data
 bias = False  # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
-learning_rate = 1e-4  # max learning rate tuned for crystal data
-max_iters = 2_500  # 600_000 # total number of training iterations
+learning_rate = 1e-3  # max learning rate tuned for crystal data
+max_iters = 2_000  # 600_000 # total number of training iterations
 weight_decay = 5e-2
 beta1 = 0.9
 beta2 = 0.95
-grad_clip = 0.5  # clip gradients at this value, or disable if == 0.0
+grad_clip = 1  # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
-decay_lr = True  # whether to decay the learning rate
+decay_lr = False # whether to decay the learning rate
 warmup_iters = 300  # how many steps to warm up for
 lr_decay_iters = max_iters + int(
     max_iters / 2
 )  # set decay schedule with training horizon
 min_lr = 2e-5  # minimum learning rate
-lattice_sigma_bins = 1.5  # smoothing width (in bins) for lattice parameters
-angle_sigma_bins = 5  # smoothing width (in bins) for lattice angles
-fractional_sigma_bins = 8  # smoothing width (in bins) for fractional coordinates
+lattice_sigma_bins = 0.25  # smoothing width (in bins) for lattice parameters
+angle_sigma_bins = 0.25  # smoothing width (in bins) for lattice angles
+fractional_sigma_bins = 0  # smoothing width (in bins) for fractional coordinates
 use_ordinal_smoothing = True  # whether to use ordinal smoothing for ordinal targets
 # DDP settings
 backend = "nccl"  # 'nccl', 'gloo', etc.
