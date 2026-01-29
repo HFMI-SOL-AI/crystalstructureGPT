@@ -14,6 +14,7 @@ import pandas as pd
 from pymatgen.core import Structure
 
 from structure_tokenizer.config import DEFAULT_CONFIG, TokenizerConfig, BinConfig
+from structure_tokenizer.quant import from_bin
 from structure_tokenizer.tokenizer import encode_to_dict
 
 
@@ -188,8 +189,24 @@ def _parse_numeric_suffix(token: str, prefix: str) -> float | None:
             return None
 
 
+def _decode_bin_value(prefix: str, bin_idx: int, bins_cfg: Mapping[str, float]) -> float:
+    """Return the physical value corresponding to a token bin index."""
+    if prefix == "[a:":
+        lo, hi, bins = bins_cfg["a_lo"], bins_cfg["a_hi"], bins_cfg["L_bins"]
+    elif prefix in {"[b/a:", "[c/a:"}:
+        lo, hi, bins = bins_cfg["r_lo"], bins_cfg["r_hi"], bins_cfg["L_bins"]
+    elif prefix in {"[alpha:", "[beta:", "[gamma:"}:
+        lo, hi, bins = bins_cfg["ang_lo"], bins_cfg["ang_hi"], bins_cfg["A_bins"]
+    elif prefix in {"[fx:", "[fy:", "[fz:"}:
+        lo, hi, bins = 0.0, 1.0, bins_cfg["F_bins"]
+    else:
+        return float(bin_idx)
+    return from_bin(bin_idx, lo, hi, bins)
+
+
 def build_vocab(
     sequences: Iterable[Sequence[str]],
+    tokenizer_config: Mapping[str, object],
 ) -> tuple[List[str], dict[str, int], OrdinalMetadata]:
     ordinal_prefixes = [
         "[a:",
@@ -207,6 +224,17 @@ def build_vocab(
     }
     other_tokens: set[str] = set()
 
+    if isinstance(tokenizer_config, Mapping):
+        bins_cfg = tokenizer_config.get("bins")
+    else:
+        bins_cfg = getattr(tokenizer_config, "bins", None)
+    if bins_cfg is None:
+        bins_cfg = asdict(DEFAULT_CONFIG.bins)
+    elif isinstance(bins_cfg, BinConfig):
+        bins_cfg = asdict(bins_cfg)
+    else:
+        bins_cfg = dict(bins_cfg)
+
     for seq in sequences:
         for token in seq:
             matched = False
@@ -214,7 +242,15 @@ def build_vocab(
                 if token.startswith(prefix) and token.endswith("]"):
                     value = _parse_numeric_suffix(token, prefix)
                     if value is not None:
-                        ordinal_tokens[prefix][token] = value
+                        try:
+                            bin_idx = int(round(value))
+                        except (TypeError, ValueError):
+                            bin_idx = None
+                        ordinal_tokens[prefix][token] = (
+                            _decode_bin_value(prefix, bin_idx, bins_cfg)
+                            if bin_idx is not None
+                            else value
+                        )
                         matched = True
                     break
             if not matched:
@@ -306,7 +342,7 @@ def main() -> None:
         if not sequences:
             raise ValueError("All samples were dropped by the max-length filter.")
 
-    vocab_list, stoi, ordinal_metadata = build_vocab(sequences)
+    vocab_list, stoi, ordinal_metadata = build_vocab(sequences, tokenizer_config)
     token_ids = encode_sequences(sequences, stoi)
 
     n = len(token_ids)
